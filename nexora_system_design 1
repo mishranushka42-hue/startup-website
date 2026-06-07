@@ -1,0 +1,483 @@
+# Nexora: System Architecture & Product Design Document
+
+Nexora is an AI-powered career guidance and mentorship platform for college students designed to bridge the gap between academic education and industry readiness. Rather than offering a simple Q&A chatbot interface, Nexora uses a hybrid system combining conversational profiling, short adaptive assessments, structured dynamic roadmaps, and mentor matching.
+
+---
+
+## 1. Complete System Architecture
+
+Nexora utilizes a **Modular Monolith** architecture for the MVP to ensure high velocity, transitioning to a distributed, event-driven microservices pattern as the user base scales.
+
+### System Components & Data Flow
+
+```mermaid
+graph TD
+    %% Clients
+    Client[Next.js Web Client] <--> |HTTPS / WSS| Gateway[API Gateway / BFF]
+    
+    %% Gateway to Core Services
+    Gateway <--> ProfileSvc[Profile & Auth Service]
+    Gateway <--> ChatSvc[Conversational Profiler Service]
+    Gateway <--> AssessSvc[Adaptive Assessment Engine]
+    Gateway <--> RoadmapSvc[Roadmap Generation Service]
+    Gateway <--> MentorSvc[Mentorship & Match Service]
+
+    %% External APIs & Integrations
+    ChatSvc <--> |Structured Outputs| LLM[Gemini 1.5 / 2.0 Flash API]
+    RoadmapSvc <--> LLM
+    RoadmapSvc --> |Async Job Queue| RedisQueue[BullMQ / Redis Cache]
+    
+    %% Databases
+    ProfileSvc <--> DB[(PostgreSQL)]
+    AssessSvc <--> DB
+    RoadmapSvc <--> DB
+    MentorSvc <--> DB
+    MentorSvc <--> VectorDB[(pgvector / Vector Search)]
+    
+    %% Caching & Storage
+    RoadmapSvc --> CDN[Cloudflare CDN / Static Assets]
+```
+
+### Key Modules
+1. **API Gateway / BFF (Backend-For-Frontend)**: Handles authentication, session management, request routing, and rate limiting.
+2. **Conversational Profiler**: Tracks user onboarding chat sessions, parses key inputs (using structured JSON schemas via LLM Function Calling), and stores raw responses.
+3. **Adaptive Assessment Engine**: Dynamically fetches assessment questions from the question bank based on estimated student ability ($\theta$) and the classified career path.
+4. **Roadmap Generation Service**: Takes scoring vectors, timeline variables, and weekly commitment data to compose a structured JSON roadmap.
+5. **Mentorship & Match Service**: Ranks mentors based on cosine similarity of user skill gaps and mentor domain expertise.
+
+---
+
+## 2. AI Workflow: Onboarding & Dynamic Path Determination
+
+To keep onboarding under **5 minutes**, the conversation balances user-friendly micro-interactions (clickable cards, quick-select suggestions) with LLM parsing. 
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Student
+    participant UI as Nexora Dashboard Client
+    participant AI as Conversational Profiler
+    participant LLM as Gemini API
+    participant DB as Postgres Database
+
+    Student->>UI: Sign Up & Load Onboarding Chat
+    UI->>AI: Init Conversation Session
+    AI->>UI: Render Greeting + Ask Name/College/Course/Year
+    Student->>UI: Inputs Basic Details (via quick forms/text)
+    UI->>AI: Post Message
+    AI->>LLM: Stream response & update Profile State
+    AI->>UI: Stream follow-up (Ask: Career Goal & Interests)
+    Student->>UI: Inputs Career Goal (e.g., "Software Engineering")
+    UI->>AI: Post Message
+    AI->>LLM: JSON Function Call: Evaluate Career Path & Interests
+    LLM-->>AI: { "target_path": "Software Engineering", "confidence": 0.95 }
+    AI->>DB: Save target path & profile state
+    AI->>UI: Present Transition Screen: "Ready for your 5-min challenge?"
+    Student->>UI: Clicks "Start Challenge"
+    UI->>AI: Trigger Adaptive Assessment
+```
+
+### Conversation Orchestration & State Tracking
+The AI Profiler maintains a state machine of missing variables:
+- `basic_info` (Name, College, Course, Year)
+- `career_goal` (Target path / industry)
+- `skills_self_report` (Self-identified skills)
+- `time_commitment` (Available hours per week)
+
+If the student is too vague, the AI uses UI buttons (e.g., "Choose from common goals: Software Eng, Data Science, Product Management, Startups") to guide them rather than prompting them for open-ended text.
+
+---
+
+## 3. Adaptive Assessment Logic
+
+Traditional career tests are tedious, leading to high drop-off rates. Nexora uses an adaptive assessment engine based on a simplified **Item Response Theory (IRT)** combined with **Branching Decision Trees**.
+
+### Dynamic Heuristics & Ability Tuning
+1. **Initial Difficulty Assignment**: The student starts at Medium difficulty ($D = 2$ on a scale of $1-3$).
+2. **Dynamic Trajectory**:
+   - Correct Answer: Increase student ability estimate $\theta_{new} = \theta_{old} + \Delta$, and present a harder question.
+   - Incorrect Answer: Decrease student ability estimate $\theta_{new} = \theta_{old} - \Delta$, and present an easier/foundational question.
+3. **Sub-Dimension Coverage**: For a target path, the assessment targets 5 key skill categories (2-3 questions per category).
+4. **Termination Criteria**:
+   - The student completes a maximum of 12 questions.
+   - The confidence interval around the student's ability level ($\theta$) stabilizes below a threshold ($\sigma^2 < 0.15$).
+
+```mermaid
+graph TD
+    Start[Onboarding Completes] --> |Target Path Classified| Q1[Question 1: Category A - Medium]
+    Q1 -->|Correct| Q2H[Question 2: Category B - Hard]
+    Q1 -->|Incorrect| Q2E[Question 2: Category B - Easy]
+    Q2H -->|Correct| Q3HH[Question 3: Category C - Hard]
+    Q2H -->|Incorrect| Q3HE[Question 3: Category C - Medium]
+    Q2E -->|Correct| Q3EH[Question 3: Category C - Medium]
+    Q2E -->|Incorrect| Q3EE[Question 3: Category C - Easy]
+```
+
+---
+
+## 4. Question Bank Examples
+
+The database stores metadata for adaptive branching. Below are examples of structured questions for different paths:
+
+### Software Engineering
+```json
+{
+  "id": "SWE_001",
+  "path": "Software Engineering",
+  "category": "DSA familiarity",
+  "difficulty": 2, // 1: Easy, 2: Medium, 3: Hard
+  "question_text": "What is the worst-case time complexity of searching for a value in a balanced Binary Search Tree (BST)?",
+  "options": [
+    {"id": "A", "text": "O(1)"},
+    {"id": "B", "text": "O(log n)"},
+    {"id": "C", "text": "O(n)"},
+    {"id": "D", "text": "O(n log n)"}
+  ],
+  "correct_option": "B",
+  "explanation": "In a balanced BST, the height of the tree is log(n). A search operation takes time proportional to the height of the tree."
+}
+```
+
+### Startups & Entrepreneurship
+```json
+{
+  "id": "STP_001",
+  "path": "Startups",
+  "category": "Market understanding",
+  "difficulty": 2,
+  "question_text": "A startup launch strategy that involves releasing a product with just enough features to satisfy early adopters and gather feedback is called:",
+  "options": [
+    {"id": "A", "text": "Beta Launch"},
+    {"id": "B", "text": "Minimum Viable Product (MVP)"},
+    {"id": "C", "text": "Proof of Concept (PoC)"},
+    {"id": "D", "text": "Product-Market Fit (PMF)"}
+  ],
+  "correct_option": "B",
+  "explanation": "An MVP is designed to test assumptions quickly with minimal resources to optimize future development cycles."
+}
+```
+
+### Higher Studies
+```json
+{
+  "id": "HST_001",
+  "path": "Higher Studies",
+  "category": "Exam awareness & Research",
+  "difficulty": 2,
+  "question_text": "Which standardized exam is primarily required for admission to MBA programs globally, focusing on analytical writing, quantitative reasoning, and verbal reasoning?",
+  "options": [
+    {"id": "A", "text": "GRE"},
+    {"id": "B", "text": "GMAT"},
+    {"id": "C", "text": "IELTS"},
+    {"id": "D", "text": "TOEFL"}
+  ],
+  "correct_option": "B",
+  "explanation": "The GMAT (Graduate Management Admission Test) is the standard exam tailored specifically for business schools."
+}
+```
+
+---
+
+## 5. Skill Scoring Framework
+
+The skill scoring system calculates a quantitative score between $1.0$ and $10.0$ for each key skill category. It aggregates self-reported skill ratings, conversational context (experience & projects), and actual assessment performance.
+
+### Scoring Formula
+For a given skill category $k$:
+
+$$S_k = w_{self} \cdot C_{self} + w_{exp} \cdot C_{exp} + w_{assess} \cdot \left( \frac{\sum_{i=1}^{n_k} A_i \cdot D_i}{\sum_{i=1}^{n_k} D_i} \right)$$
+
+Where:
+- $C_{self}$: Self-reported skill level (1.0 to 10.0).
+- $C_{exp}$: Conversational profiling adjustment (1.0 to 10.0 based on projects / internships mentioned).
+- $A_i$: Binary answer score (1 for correct, 0 for incorrect) for question $i$ in category $k$.
+- $D_i$: Difficulty weight of the question (Easy = 1, Medium = 2, Hard = 3).
+- $w_{self}$, $w_{exp}$, $w_{assess}$: Weights summing to $1.0$ (e.g., $w_{self} = 0.15$, $w_{exp} = 0.25$, $w_{assess} = 0.60$).
+
+### Skill Level Categorization
+- **1.0 – 4.0**: **Explorer / Foundational** (Requires fundamental learning path).
+- **4.1 – 7.0**: **Practitioner / Intermediate** (Requires project building and specialized tool execution).
+- **7.1 – 10.0**: **Advanced / Specialized** (Requires mock interviews, advanced problem-solving, and professional mentorship).
+
+---
+
+## 6. Roadmap Generation Algorithm
+
+The roadmap generator is a hybrid engine: it uses deterministic rules to establish time-blocking, structural milestones, and core skill mapping, while leveraging LLMs (e.g., Gemini API) to flesh out personalized resources, custom sub-tasks, and project briefs.
+
+### The Dynamic Schedular (Pseudo-code)
+
+```python
+def generate_weekly_roadmap(student_profile, skill_scores, assessment_results):
+    """
+    Inputs:
+      - student_profile: { target_path, available_hours_per_week, year_of_study, time_to_goal_months }
+      - skill_scores: { "DSA": 3.5, "Git": 2.0, "SystemDesign": 1.0, ... }
+      - assessment_results: list of { question_id, correct }
+    """
+    total_months = student_profile["time_to_goal_months"]
+    total_weeks = total_months * 4
+    available_hours = student_profile["available_hours_per_week"]
+    
+    # Identify gaps: Any skill score < 6.0 is marked as a gap, sorted by lowest score
+    skill_gaps = [k for k, v in sorted(skill_scores.items(), key=lambda item: item[1])]
+    
+    phases = [
+        {"name": "Phase 1: Foundations & Fundamentals", "duration_weeks": int(total_weeks * 0.25), "skills": []},
+        {"name": "Phase 2: Core Skill Development", "duration_weeks": int(total_weeks * 0.40), "skills": []},
+        {"name": "Phase 3: Building & Portfolio Creation", "duration_weeks": int(total_weeks * 0.20), "skills": []},
+        {"name": "Phase 4: Interview Prep & Mentorship Polish", "duration_weeks": int(total_weeks * 0.15), "skills": []}
+    ]
+    
+    # Distribute skill gaps across phases dynamically
+    for gap in skill_gaps:
+        score = skill_scores[gap]
+        if score < 3.0:
+            phases[0]["skills"].append(gap) # Critical basics
+        elif score < 6.0:
+            phases[1]["skills"].append(gap) # Core skills
+            
+    # Compose structured prompt to LLM to inject curated resources and project descriptions
+    roadmap_json = call_llm_for_roadmap_detailing(phases, available_hours, student_profile["target_path"])
+    
+    return roadmap_json
+```
+
+### Structured Prompt Variables passed to LLM
+- Target Career Path: `Software Engineering (Backend Developer)`
+- Skill Matrix: `DSA: 3.2 (Foundational), API Design: 5.5 (Intermediate), Docker/Cloud: 1.0 (Critical Gap)`
+- Weekly Budget: `12 hours / week`
+- Desired Output: Structured JSON conforming strictly to a TypeScript interface representing `RoadmapPhase[]` containing specific project guidelines and high-quality resource links.
+
+---
+
+## 7. Mentor Matching Algorithm
+
+To connect students with the right career mentors, Nexora evaluates a combination of **Cosine Similarity** of vector embeddings (representing student gaps and mentor profiles) and deterministic filters (availability, target path, budget).
+
+### Similarity Vector Formulation
+1. **Student Gap Vector ($V_s$)**: Formulated based on $10 - S_k$ for each skill category $k$.
+2. **Mentor Expert Vector ($V_m$)**: Created from the mentor's expertise matrix (scores from 1-10 on their teaching strengths).
+
+$$\text{Skill Alignment Score} = \cos(\theta) = \frac{V_s \cdot V_m}{\|V_s\| \|V_m\|}$$
+
+### Matching Algorithm Workflow
+```python
+def get_recommended_mentors(student_id, limit=3):
+    student = db.query("SELECT * FROM users WHERE id = %s", student_id)
+    student_gaps = db.query("SELECT skill_name, (10.0 - score) as gap FROM user_skills WHERE user_id = %s", student_id)
+    
+    # Format student gap vector
+    v_student = format_vector(student_gaps)
+    
+    # Query all active mentors in the same target path
+    mentors = db.query("SELECT * FROM mentors WHERE target_path = %s AND is_active = TRUE", student["target_path"])
+    
+    scored_mentors = []
+    for mentor in mentors:
+        v_mentor = format_vector(mentor["expertise"])
+        similarity = cosine_similarity(v_student, v_mentor)
+        
+        # Calculate bonus score for background alignment (same college or company of student's dream)
+        match_bonus = 0.0
+        if mentor["company"] in student["target_companies"]:
+            match_bonus += 0.15
+        if mentor["college"] == student["college"]:
+            match_bonus += 0.10
+            
+        final_score = (similarity * 0.75) + (match_bonus * 0.25)
+        scored_mentors.append({"mentor": mentor, "score": final_score})
+        
+    # Sort by score descending
+    scored_mentors.sort(key=lambda x: x["score"], reverse=True)
+    return scored_mentors[:limit]
+```
+
+---
+
+## 8. Database Design
+
+Nexora uses a relational PostgreSQL schema (with `pgvector` enabled) to ensure strict data validation and efficient similarity calculations.
+
+```mermaid
+erDiagram
+    USERS {
+        uuid id PK
+        string email UK
+        string password_hash
+        string name
+        string college
+        string course
+        int year_of_study
+        string target_path
+        int hours_per_week
+        timestamp created_at
+    }
+    
+    USER_SKILLS {
+        uuid id PK
+        uuid user_id FK
+        string skill_name
+        float score
+        timestamp updated_at
+    }
+    
+    ASSESSMENTS {
+        uuid id PK
+        uuid user_id FK
+        string path
+        float final_theta
+        timestamp completed_at
+    }
+
+    ASSESSMENT_RESPONSES {
+        uuid id PK
+        uuid assessment_id FK
+        string question_id
+        string selected_option
+        boolean is_correct
+        timestamp response_time
+    }
+
+    ROADMAPS {
+        uuid id PK
+        uuid user_id FK
+        string title
+        int duration_weeks
+        jsonb phases_data
+        timestamp created_at
+    }
+
+    MENTORS {
+        uuid id PK
+        string name
+        string company
+        string role
+        vector expertise_vector
+        string bio
+        string avatar_url
+        boolean is_active
+    }
+
+    BOOKINGS {
+        uuid id PK
+        uuid user_id FK
+        uuid mentor_id FK
+        timestamp session_time
+        string status
+        string meeting_link
+    }
+
+    USERS ||--o{ USER_SKILLS : has
+    USERS ||--o{ ASSESSMENTS : completes
+    USERS ||--|| ROADMAPS : follows
+    ASSESSMENTS ||--o{ ASSESSMENT_RESPONSES : records
+    USERS ||--o{ BOOKINGS : books
+    MENTORS ||--o{ BOOKINGS : accepts
+```
+
+---
+
+## 9. Dashboard UI Design
+
+The interface adopts a premium, high-visual-contrast design system featuring a sleek dark mode with HSL-tailored colors, card-based glassmorphism, and responsive navigation.
+
+### Visual Representation: Home Dashboard & Dynamic Roadmap
+
+```
+========================================================================================================
+ NEXORA   [ Explore Path ]   [ My Roadmap ]   [ Mentors ]                      [ Profile ] (🔔)  (👤 Student)
+========================================================================================================
+ Welcome back, Alex! 👋
+ Your Target Path: SOFTWARE ENGINEERING (Backend Developer)
+ -------------------------------------------------------------------------------------------------------
+ [ YOUR SKILL MATRIX ]                                    [ MY WEEKLY FOCUS: WEEK 4 OF 16 ]
+ +---------------------------------------------------+    +--------------------------------------------+
+ | Skill           Level   [█ █ █ █ ░ ░ ░ ░ ░ ░]     |    | Focus: Dynamic Data Structures & Arrays    |
+ | DSA             3.5/10  [██████░░░░] Foundational |    | Goal: Solve 5 Queue/Stack problems         |
+ | API Design      5.5/10  [████████░░] Intermediate |    | Commit: 10 Hours (4 Hours completed)       |
+ | System Design   1.0/10  [██░░░░░░░░] Critical Gap |    |                                            |
+ | Git / GitHub    6.0/10  [██████████] Intermediate |    | [▶] Start Week 4 Module                    |
+ +---------------------------------------------------+    +--------------------------------------------+
+
+ [ YOUR PERSONALIZED ROADMAP ]
+ ───────────────────────────────────────────────────────────────────────────────────────────────────────
+  ▼ Phase 1: Foundations & Problem Solving (Week 1 - 4)  [=============>  80% Completed]
+    [x] Week 1: Basic Python Syntax & Git Fundamentals  (Resource: Nexora-Git-Lab)
+    [x] Week 2: Space & Time Complexity (Big O)          (Resource: Harvard CS50)
+    [x] Week 3: Linear Data Structures (Arrays & Lists)  (Resource: NeetCode 150)
+    [o] Week 4: Dynamic Data Structures (Stacks & Queues) [In Progress]
+        --> Task: Implement a queue using two stacks [Start]
+        --> Resource: [GeeksforGeeks Stack Implementation] (Open Link)
+        
+  ▶ Phase 2: Backend Core - API Construction (Week 5 - 10)  [0% Completed]
+  ▶ Phase 3: Databases & Containerization (Week 11 - 14)    [0% Completed]
+  ▶ Phase 4: Capstone & Portfolio Polish (Week 15 - 16)     [0% Completed]
+ ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ [ RECOMMENDED MENTORS FOR YOU ]
+ +------------------------------+  +------------------------------+  +------------------------------+
+ | Rohan Mehta                  |  | Priya Sharma                 |  | Amit Verma                   |
+ | SDE-2 @ Microsoft (DSA Lead) |  | Backend Lead @ Razorpay      |  | Tech Lead @ Stripe (System)  |
+ | Score Match: 95%             |  | Score Match: 88%             |  | Score Match: 84%             |
+ | [ Book 1:1 Session ]         |  | [ Book 1:1 Session ]         |  | [ Book 1:1 Session ]         |
+ +------------------------------+  +------------------------------+  +------------------------------+
+```
+
+---
+
+## 10. Student Journey: Sign Up to Mentorship
+
+The product journey is optimized to ensure that the student is set up with an actionable, personalized path in under 5 minutes.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Signup : Student enters Email & Password
+    Signup --> AI_Chat : Conversational Profiling (4 questions)
+    AI_Chat --> Path_Classified : Target Path chosen by AI Engine
+    Path_Classified --> Adaptive_Assessment : Launch 10-Question Skill Test
+    Adaptive_Assessment --> Scoring_Calculated : Scoring Formula runs (Normalized 1-10)
+    Scoring_Calculated --> Roadmap_Generated : Custom Roadmap built dynamically
+    Roadmap_Generated --> Dashboard_Active : Student enters interactive dashboard
+    Dashboard_Active --> Mentor_Matched : Mentor recommendation highlights skill gaps
+    Mentor_Matched --> Session_Booked : Student schedules 1:1 mentor sync
+```
+
+### Visual & Interactive Micro-cues:
+- **Gamified Progress Bar**: Keeps the user engaged during the 10-question assessment ("Question 3 of 10").
+- **Dynamic Skill Chart**: When the student finishes the assessment, a dynamic radial chart animates in, mapping their strengths and gaps visually.
+- **The "Generate" Reveal**: Once the assessment finishes, an animated loader says: *"Curating resources from MIT, freeCodeCamp, and Neetcode based on your target path... Done!"* to establish trust and premium product quality.
+
+---
+
+## 11. MVP Implementation Plan (6-Week Timeline)
+
+An iterative, feature-boxed roadmap to launch the Nexora MVP.
+
+### Timeline & Phases
+- **Week 1-2 (Phase 1: Core AI Profile & Onboarding Engine)**:
+  - Set up Next.js architecture and Tailwind CSS (if requested) / Vanilla CSS tokens.
+  - Implement chat client interface with LLM integration to capture user profiling parameters.
+  - Set up Database schemas in PostgreSQL.
+- **Week 3-4 (Phase 2: Adaptive Assessment & Skill Engine)**:
+  - Populate the initial Question Bank (100 questions covering SWE, Startups, Higher Studies).
+  - Implement the IRT-like adaptive branching algorithm.
+  - Write test specs to verify difficulty adaptations.
+- **Week 5-6 (Phase 3: Roadmap Generation & Mentor Match)**:
+  - Build the prompt-chain to fetch personalized roadmap templates from Gemini.
+  - Code the Cosine Similarity vector matching in `pgvector` for recommended mentors.
+  - Integration testing of the full signup-to-dashboard workflow.
+
+---
+
+## 12. Future Scalability Plan
+
+To scale Nexora from MVP to hundreds of thousands of concurrent active students:
+
+1. **LLM Cost & Latency Optimization**:
+   - **Semantic Caching**: Cache common roadmap templates in Redis. If two students have similar paths and skill levels, retrieve the baseline cached roadmap, then customize it using minimal agent runs.
+   - **JSON Schema Output**: Use local light-weight models (e.g., Llama 3) for standard entity parsing, and reserve larger models (like Gemini Pro) for roadmap generation.
+2. **Vector Indexing for Mentors**:
+   - As the mentor network grows to thousands, use an HNSW index in PostgreSQL (`pgvector`) to ensure sub-millisecond query search latency.
+3. **Feedback-Loop Fine-Tuning**:
+   - Track student completion rates on roadmap milestones. If students consistently drop out at Week 3 of a specific path, mark that resource as "difficult" and auto-adjust the roadmap generator to recommend alternative paths or easier introductory resources.
